@@ -1,0 +1,22 @@
+# dependencies
+node_modules/
+
+# env / secrets
+.env
+.env.*
+
+# next.js
+.next/
+out/
+build/
+next-env.d.ts
+*.tsbuildinfo
+.vercel
+
+# os
+.DS_Store
+
+# Real participant forms = children's PII. Never commit.
+samples/
+*.heic
+*.HEIC
