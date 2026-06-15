@@ -1,16 +1,26 @@
 import { NextResponse } from "next/server";
 import { requireAuth } from "@/lib/auth";
+import { appendRows, ensureTab } from "@/lib/sheets";
 import type { Batch, ExtractedFields } from "@/lib/types";
 
-// Appends one confirmed enrollment as a row in the Google Sheet.
-//
-// TODO(phase 7): write to the Sheet via the service account.
-//   - read GOOGLE_SERVICE_ACCOUNT_JSON + SHEET_ID from env
-//   - auth with googleapis, sheets.spreadsheets.values.append
-//   - row order: [year, program, first_name, last_name, dob, cell_phone, email, address, savedAt]
-//   - on write failure return 502 so the client blocks + lets the volunteer retry
-// For now this validates the payload and acknowledges, so the capture →
-// extract → confirm flow is testable end-to-end before the Sheet is wired.
+// Appends one confirmed enrollment as a row in the Google Sheet (the only
+// datastore). On any write failure we return 502 so the client blocks and lets
+// the volunteer retry without losing the typed data.
+
+export const maxDuration = 30;
+
+const DATA_TAB = "Entries";
+const HEADER = [
+  "First Name",
+  "Last Name",
+  "DOB",
+  "Cell Phone",
+  "Email",
+  "Address",
+  "Program",
+  "Year",
+  "Saved At",
+];
 
 type SaveBody = { fields?: Partial<ExtractedFields>; batch?: Partial<Batch> };
 
@@ -41,6 +51,24 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "Missing batch program/year." }, { status: 400 });
   }
 
-  // Phase 7 replaces this no-op with the Sheets append.
-  return NextResponse.json({ ok: true });
+  const row = [
+    f.first_name!.trim(),
+    f.last_name!.trim(),
+    f.dob?.trim() ?? "",
+    f.cell_phone?.trim() ?? "",
+    f.email?.trim() ?? "",
+    f.address?.trim() ?? "",
+    b.program.trim(),
+    b.year,
+    new Date().toISOString(),
+  ];
+
+  try {
+    await ensureTab(DATA_TAB, HEADER);
+    await appendRows(DATA_TAB, [row]);
+    return NextResponse.json({ ok: true });
+  } catch (e) {
+    const message = e instanceof Error ? e.message : "Save failed";
+    return NextResponse.json({ error: message }, { status: 502 });
+  }
 }
