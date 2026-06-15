@@ -2,7 +2,6 @@
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { useCallback, useEffect, useRef, useState } from "react";
-import { loadScanner } from "@/lib/scanner";
 import type { Batch } from "@/lib/types";
 
 type Status =
@@ -16,57 +15,39 @@ type Status =
 const VIDEO_W_IDEAL = 2560;
 const VIDEO_H_IDEAL = 1440;
 const CAPTURE_MAX_EDGE = 1568; // matches the resolution Claude effectively sees
-const PROC_WIDTH = 480; // downscaled width for detection (speed)
-const COVERAGE_MIN = 0.3; // document must fill >= 30% of the frame
-const DETECT_STREAK_FRAMES = 20; // ~0.7s of continuous detection → auto-capture
-const SHARP_SAMPLES = 7; // frames sampled per capture
-const SHARP_INTERVAL_MS = 40; // spacing between samples (~280ms total)
 
-type Pt = [number, number];
+// Auto-capture tuning (all surfaced in the on-screen HUD for calibration):
+const METRIC_W = 200; // width of the small gray frame used for metrics
+const MOTION_MAX = 4.0; // mean per-pixel gray-diff below this = "steady"
+const SHARP_MIN = 40; // Laplacian variance above this = "in focus / has content"
+const LOCK_MS = 900; // must stay steady + focused this long before auto-snap
+
+const SHARP_SAMPLES = 7; // frames sampled per capture, sharpest kept
+const SHARP_INTERVAL_MS = 40;
 
 const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-function quadArea(p: Pt[]): number {
-  let a = 0;
-  for (let i = 0; i < p.length; i++) {
-    const j = (i + 1) % p.length;
-    a += p[i][0] * p[j][1] - p[j][0] * p[i][1];
-  }
-  return Math.abs(a) / 2;
-}
-
-function drawQuad(
-  ctx: CanvasRenderingContext2D,
-  p: Pt[],
-  sx: number,
-  sy: number,
-  color: string,
-) {
-  ctx.beginPath();
-  ctx.moveTo(p[0][0] * sx, p[0][1] * sy);
-  for (let i = 1; i < p.length; i++) ctx.lineTo(p[i][0] * sx, p[i][1] * sy);
-  ctx.closePath();
-  ctx.lineWidth = 4;
-  ctx.strokeStyle = color;
-  ctx.stroke();
-}
-
-// Sharpness = variance of the Laplacian on a small grayscale copy. Higher = crisper.
-function sharpnessFromVideo(
+// Returns { sharp, motion } from a small grayscale copy of the current frame.
+// sharp = variance of Laplacian (focus/content). motion = mean abs diff vs the
+// previous frame (camera shake). Both are cheap at 200px wide.
+function computeMetrics(
   video: HTMLVideoElement,
   scratch: HTMLCanvasElement,
-): number {
-  const w = 320;
+  prevGray: { current: Float64Array | null },
+): { sharp: number; motion: number } {
+  const w = METRIC_W;
   const h = Math.max(1, Math.round((video.videoHeight / video.videoWidth) * w));
   scratch.width = w;
   scratch.height = h;
   const ctx = scratch.getContext("2d", { willReadFrequently: true })!;
   ctx.drawImage(video, 0, 0, w, h);
   const d = ctx.getImageData(0, 0, w, h).data;
-  const g = new Float64Array(w * h);
+
+  const gray = new Float64Array(w * h);
   for (let i = 0, p = 0; i < d.length; i += 4, p++) {
-    g[p] = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+    gray[p] = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
   }
+
   let sum = 0;
   let sum2 = 0;
   let n = 0;
@@ -74,15 +55,25 @@ function sharpnessFromVideo(
     for (let x = 1; x < w - 1; x++) {
       const idx = y * w + x;
       const lap =
-        -4 * g[idx] + g[idx - 1] + g[idx + 1] + g[idx - w] + g[idx + w];
+        -4 * gray[idx] + gray[idx - 1] + gray[idx + 1] + gray[idx - w] + gray[idx + w];
       sum += lap;
       sum2 += lap * lap;
       n++;
     }
   }
-  if (!n) return 0;
-  const mean = sum / n;
-  return sum2 / n - mean * mean;
+  const mean = n ? sum / n : 0;
+  const sharp = n ? sum2 / n - mean * mean : 0;
+
+  let motion = 999;
+  const prev = prevGray.current;
+  if (prev && prev.length === gray.length) {
+    let s = 0;
+    for (let i = 0; i < gray.length; i++) s += Math.abs(gray[i] - prev[i]);
+    motion = s / gray.length;
+  }
+  prevGray.current = gray;
+
+  return { sharp, motion };
 }
 
 export default function CameraScreen({
@@ -97,19 +88,21 @@ export default function CameraScreen({
   const videoRef = useRef<HTMLVideoElement>(null);
   const overlayRef = useRef<HTMLCanvasElement>(null);
   const hudRef = useRef<HTMLDivElement>(null);
-  const procRef = useRef<HTMLCanvasElement | null>(null);
+  const scratchRef = useRef<HTMLCanvasElement | null>(null);
+  const prevGrayRef = useRef<Float64Array | null>(null);
+  const lockStartRef = useRef<number | null>(null);
   const rafRef = useRef<number | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
-  const scannerRef = useRef<any>(null);
-  const cvLoadedRef = useRef(false);
-  const streakRef = useRef(0);
   const capturedRef = useRef(false);
 
   const [status, setStatus] = useState<Status>("starting");
   const [hint, setHint] = useState("Point at a form");
-  const [autoReady, setAutoReady] = useState(false);
 
-  // Grab several frames, keep the sharpest → big win against hand-shake blur.
+  const setHintOnce = useCallback((h: string) => {
+    setHint((prev) => (prev === h ? prev : h));
+  }, []);
+
+  // Grab several frames, keep the sharpest → beats hand-shake motion blur.
   const captureSharpest = useCallback(async () => {
     const video = videoRef.current;
     if (capturedRef.current || !video || !video.videoWidth) return;
@@ -122,7 +115,8 @@ export default function CameraScreen({
     const scale = Math.min(1, CAPTURE_MAX_EDGE / Math.max(vw, vh));
     const cw = Math.round(vw * scale);
     const ch = Math.round(vh * scale);
-    const scratch = document.createElement("canvas");
+    const metric = document.createElement("canvas");
+    const prevGray = { current: null as Float64Array | null };
     const best = document.createElement("canvas");
     best.width = cw;
     best.height = ch;
@@ -130,9 +124,9 @@ export default function CameraScreen({
     let bestScore = -1;
 
     for (let i = 0; i < SHARP_SAMPLES; i++) {
-      const score = sharpnessFromVideo(video, scratch);
-      if (score > bestScore) {
-        bestScore = score;
+      const { sharp } = computeMetrics(video, metric, prevGray);
+      if (sharp > bestScore) {
+        bestScore = sharp;
         bestCtx.drawImage(video, 0, 0, cw, ch); // same frame we just scored
       }
       if (i < SHARP_SAMPLES - 1) await delay(SHARP_INTERVAL_MS);
@@ -169,7 +163,6 @@ export default function CameraScreen({
           return;
         }
         streamRef.current = stream;
-        // Best-effort continuous autofocus (support varies by device).
         try {
           const track = stream.getVideoTracks()[0];
           const caps = (track.getCapabilities?.() ?? {}) as any;
@@ -198,106 +191,85 @@ export default function CameraScreen({
     };
   }, []);
 
-  // Load detection (best-effort) and run the per-frame loop.
+  // Per-frame metrics → steady+focused lock → auto-capture.
   useEffect(() => {
     if (status !== "scanning") return;
     let active = true;
 
-    function detectFrame(video: HTMLVideoElement, overlay: HTMLCanvasElement) {
-      const w = window as any;
+    function drawGuide(overlay: HTMLCanvasElement, locking: boolean) {
       const octx = overlay.getContext("2d")!;
-      const rect = video.getBoundingClientRect();
-      if (overlay.width !== rect.width || overlay.height !== rect.height) {
-        overlay.width = rect.width;
-        overlay.height = rect.height;
-      }
       octx.clearRect(0, 0, overlay.width, overlay.height);
-
-      let detected = false;
-      let coverage = 0;
-
-      if (scannerRef.current && w.cv) {
-        if (!procRef.current) procRef.current = document.createElement("canvas");
-        const proc = procRef.current;
-        const pw = PROC_WIDTH;
-        const ph = Math.round((video.videoHeight / video.videoWidth) * PROC_WIDTH);
-        proc.width = pw;
-        proc.height = ph;
-        proc.getContext("2d")!.drawImage(video, 0, 0, pw, ph);
-
-        let mat: any;
-        try {
-          mat = w.cv.imread(proc);
-          const contour = scannerRef.current.findPaperContour(mat);
-          if (contour) {
-            const c = scannerRef.current.getCornerPoints(contour);
-            const pts: Pt[] = [
-              [c.topLeftCorner.x, c.topLeftCorner.y],
-              [c.topRightCorner.x, c.topRightCorner.y],
-              [c.bottomRightCorner.x, c.bottomRightCorner.y],
-              [c.bottomLeftCorner.x, c.bottomLeftCorner.y],
-            ];
-            coverage = quadArea(pts) / (pw * ph);
-            detected = coverage >= COVERAGE_MIN;
-            drawQuad(
-              octx,
-              pts,
-              overlay.width / pw,
-              overlay.height / ph,
-              detected ? "#22c55e" : "#eab308",
-            );
-          }
-        } catch {
-          /* ignore frame */
-        }
-        mat?.delete?.();
-      }
-
-      if (detected) {
-        streakRef.current += 1;
-        setHint("Hold still…");
-        if (streakRef.current >= DETECT_STREAK_FRAMES) captureSharpest();
-      } else {
-        streakRef.current = 0;
-        setHint(coverage > 0 ? "Move closer — fill the frame" : "Point at a form");
-      }
-
-      if (hudRef.current) {
-        hudRef.current.textContent = `cv:${cvLoadedRef.current ? "y" : "n"} det:${
-          detected ? "y" : "n"
-        } cov:${Math.round(coverage * 100)}% streak:${streakRef.current}`;
-      }
+      const m = overlay.width * 0.06;
+      const w = overlay.width - m * 2;
+      const h = Math.min(overlay.height - m * 2, w * (4 / 3));
+      const x = (overlay.width - w) / 2;
+      const y = (overlay.height - h) / 2;
+      const r = 16;
+      octx.beginPath();
+      octx.moveTo(x + r, y);
+      octx.arcTo(x + w, y, x + w, y + h, r);
+      octx.arcTo(x + w, y + h, x, y + h, r);
+      octx.arcTo(x, y + h, x, y, r);
+      octx.arcTo(x, y, x + w, y, r);
+      octx.closePath();
+      octx.lineWidth = locking ? 6 : 3;
+      octx.strokeStyle = locking ? "#22c55e" : "rgba(255,255,255,0.5)";
+      octx.stroke();
     }
 
     function loop() {
       if (!active || capturedRef.current) return;
       const video = videoRef.current;
       const overlay = overlayRef.current;
-      if (video && overlay && video.videoWidth) detectFrame(video, overlay);
+      if (video && overlay && video.videoWidth) {
+        const rect = video.getBoundingClientRect();
+        if (overlay.width !== rect.width || overlay.height !== rect.height) {
+          overlay.width = rect.width;
+          overlay.height = rect.height;
+        }
+        if (!scratchRef.current) scratchRef.current = document.createElement("canvas");
+
+        const { sharp, motion } = computeMetrics(
+          video,
+          scratchRef.current,
+          prevGrayRef,
+        );
+        const steady = motion < MOTION_MAX;
+        const focused = sharp > SHARP_MIN;
+        const locking = steady && focused;
+
+        drawGuide(overlay, locking);
+
+        const now = performance.now();
+        let held = 0;
+        if (locking) {
+          if (lockStartRef.current == null) lockStartRef.current = now;
+          held = now - lockStartRef.current;
+          setHintOnce("Hold still…");
+          if (held >= LOCK_MS) {
+            captureSharpest();
+            return;
+          }
+        } else {
+          lockStartRef.current = null;
+          setHintOnce(focused ? "Hold steady" : "Point at a form");
+        }
+
+        if (hudRef.current) {
+          hudRef.current.textContent = `sharp:${Math.round(sharp)} mot:${motion.toFixed(
+            1,
+          )} held:${Math.round(held)}ms`;
+        }
+      }
       rafRef.current = requestAnimationFrame(loop);
     }
 
-    (async () => {
-      const ok = await loadScanner();
-      if (!active) return;
-      cvLoadedRef.current = ok;
-      if (ok) {
-        try {
-          scannerRef.current = new (window as any).jscanify();
-          setAutoReady(true);
-        } catch {
-          cvLoadedRef.current = false;
-          setAutoReady(false);
-        }
-      }
-      loop();
-    })();
-
+    loop();
     return () => {
       active = false;
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
     };
-  }, [status, captureSharpest]);
+  }, [status, captureSharpest, setHintOnce]);
 
   return (
     <div className="relative min-h-dvh overflow-hidden bg-black">
@@ -337,24 +309,14 @@ export default function CameraScreen({
       />
 
       {status === "scanning" && (
-        <>
-          <div className="pointer-events-none absolute inset-0 flex items-center justify-center p-8">
-            <div
-              className="w-full rounded-2xl border-2 border-white/40"
-              style={{ aspectRatio: "3 / 4", maxHeight: "70%" }}
-            />
-          </div>
-          <div className="absolute bottom-0 z-20 flex w-full flex-col items-center gap-4 bg-gradient-to-t from-black/70 to-transparent px-6 pb-10 pt-14">
-            <p className="text-center text-sm text-white">
-              {autoReady ? hint : "Tap the button to capture"}
-            </p>
-            <button
-              onClick={captureSharpest}
-              aria-label="Capture"
-              className="h-16 w-16 rounded-full border-4 border-white bg-white/20 transition active:scale-95"
-            />
-          </div>
-        </>
+        <div className="absolute bottom-0 z-20 flex w-full flex-col items-center gap-4 bg-gradient-to-t from-black/70 to-transparent px-6 pb-10 pt-14">
+          <p className="text-center text-sm text-white">{hint}</p>
+          <button
+            onClick={captureSharpest}
+            aria-label="Capture"
+            className="h-16 w-16 rounded-full border-4 border-white bg-white/20 transition active:scale-95"
+          />
+        </div>
       )}
 
       {status === "capturing" && (
