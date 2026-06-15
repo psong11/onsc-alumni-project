@@ -106,7 +106,6 @@ export default function CameraScreen({
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const overlayRef = useRef<HTMLCanvasElement>(null);
-  const hudRef = useRef<HTMLDivElement>(null);
   const scratchRef = useRef<HTMLCanvasElement | null>(null);
   const prevGrayRef = useRef<Float64Array | null>(null);
   const lockStartRef = useRef<number | null>(null);
@@ -277,10 +276,9 @@ export default function CameraScreen({
 
         drawGuide(overlay, inSession);
 
-        let held = 0;
         if (inSession) {
           if (lockStartRef.current == null) lockStartRef.current = now;
-          held = now - lockStartRef.current;
+          const held = now - lockStartRef.current;
           setHintOnce("Hold still…");
           if (held >= LOCK_MS) {
             captureSharpest();
@@ -289,12 +287,6 @@ export default function CameraScreen({
         } else {
           lockStartRef.current = null;
           setHintOnce(!paper ? "Fit the whole form in the frame" : "Hold steady");
-        }
-
-        if (hudRef.current) {
-          hudRef.current.textContent = `sharp:${Math.round(sharp)} mot:${motionAvg.toFixed(
-            1,
-          )} held:${Math.round(held)}ms`;
         }
       }
       rafRef.current = requestAnimationFrame(loop);
@@ -325,12 +317,6 @@ export default function CameraScreen({
           Change batch
         </button>
       </div>
-
-      {/* debug HUD — remove once auto-capture is dialed in */}
-      <div
-        ref={hudRef}
-        className="absolute left-2 top-12 z-20 rounded bg-black/60 px-2 py-1 font-mono text-[11px] text-green-300"
-      />
 
       <video
         ref={videoRef}
