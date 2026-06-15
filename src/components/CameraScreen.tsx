@@ -21,6 +21,8 @@ const METRIC_W = 200; // width of the small gray frame used for metrics
 const MOTION_MAX = 8.0; // smoothed gray-diff below this = "steady" (handheld-friendly)
 const MOTION_SMOOTH = 0.35; // EMA weight on new motion samples (smooths jitter spikes)
 const SHARP_MIN = 40; // Laplacian variance above this = "in focus / has content"
+const BRIGHT_LUMA = 150; // gray value above this counts as "paper-white"
+const BRIGHT_FRAC_MIN = 0.55; // this fraction of the center being paper-white = a form fills the frame
 const LOCK_GRACE_MS = 250; // tolerate brief unsteady blips without resetting the countdown
 const LOCK_MS = 800; // must stay steady + focused this long before auto-snap
 
@@ -36,7 +38,7 @@ function computeMetrics(
   video: HTMLVideoElement,
   scratch: HTMLCanvasElement,
   prevGray: { current: Float64Array | null },
-): { sharp: number; motion: number } {
+): { sharp: number; motion: number; bright: number } {
   const w = METRIC_W;
   const h = Math.max(1, Math.round((video.videoHeight / video.videoWidth) * w));
   scratch.width = w;
@@ -75,7 +77,22 @@ function computeMetrics(
   }
   prevGray.current = gray;
 
-  return { sharp, motion };
+  // Paper-present heuristic: fraction of the center region that is paper-white.
+  let bri = 0;
+  let btot = 0;
+  const x0 = Math.floor(w * 0.2);
+  const x1 = Math.ceil(w * 0.8);
+  const y0 = Math.floor(h * 0.15);
+  const y1 = Math.ceil(h * 0.85);
+  for (let y = y0; y < y1; y++) {
+    for (let x = x0; x < x1; x++) {
+      if (gray[y * w + x] > BRIGHT_LUMA) bri++;
+      btot++;
+    }
+  }
+  const bright = btot ? bri / btot : 0;
+
+  return { sharp, motion, bright };
 }
 
 export default function CameraScreen({
@@ -233,7 +250,7 @@ export default function CameraScreen({
         }
         if (!scratchRef.current) scratchRef.current = document.createElement("canvas");
 
-        const { sharp, motion } = computeMetrics(
+        const { sharp, motion, bright } = computeMetrics(
           video,
           scratchRef.current,
           prevGrayRef,
@@ -247,7 +264,8 @@ export default function CameraScreen({
 
         const steady = motionAvg < MOTION_MAX;
         const focused = sharp > SHARP_MIN;
-        const locking = steady && focused;
+        const paper = bright > BRIGHT_FRAC_MIN; // a bright page fills the frame
+        const locking = steady && focused && paper;
 
         const now = performance.now();
         if (locking) lastLockingRef.current = now;
@@ -270,7 +288,7 @@ export default function CameraScreen({
           }
         } else {
           lockStartRef.current = null;
-          setHintOnce(focused ? "Hold steady" : "Point at a form");
+          setHintOnce(!paper ? "Fit the whole form in the frame" : "Hold steady");
         }
 
         if (hudRef.current) {
