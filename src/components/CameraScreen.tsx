@@ -18,9 +18,11 @@ const CAPTURE_MAX_EDGE = 1568; // matches the resolution Claude effectively sees
 
 // Auto-capture tuning (all surfaced in the on-screen HUD for calibration):
 const METRIC_W = 200; // width of the small gray frame used for metrics
-const MOTION_MAX = 4.0; // mean per-pixel gray-diff below this = "steady"
+const MOTION_MAX = 8.0; // smoothed gray-diff below this = "steady" (handheld-friendly)
+const MOTION_SMOOTH = 0.35; // EMA weight on new motion samples (smooths jitter spikes)
 const SHARP_MIN = 40; // Laplacian variance above this = "in focus / has content"
-const LOCK_MS = 900; // must stay steady + focused this long before auto-snap
+const LOCK_GRACE_MS = 250; // tolerate brief unsteady blips without resetting the countdown
+const LOCK_MS = 800; // must stay steady + focused this long before auto-snap
 
 const SHARP_SAMPLES = 7; // frames sampled per capture, sharpest kept
 const SHARP_INTERVAL_MS = 40;
@@ -91,6 +93,8 @@ export default function CameraScreen({
   const scratchRef = useRef<HTMLCanvasElement | null>(null);
   const prevGrayRef = useRef<Float64Array | null>(null);
   const lockStartRef = useRef<number | null>(null);
+  const motionAvgRef = useRef<number | null>(null);
+  const lastLockingRef = useRef<number | null>(null);
   const rafRef = useRef<number | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const capturedRef = useRef(false);
@@ -234,15 +238,29 @@ export default function CameraScreen({
           scratchRef.current,
           prevGrayRef,
         );
-        const steady = motion < MOTION_MAX;
+
+        // Smooth motion with an EMA so single jittery frames don't break the lock.
+        const prevAvg = motionAvgRef.current;
+        const motionAvg =
+          prevAvg == null ? motion : prevAvg + MOTION_SMOOTH * (motion - prevAvg);
+        motionAvgRef.current = motionAvg;
+
+        const steady = motionAvg < MOTION_MAX;
         const focused = sharp > SHARP_MIN;
         const locking = steady && focused;
 
-        drawGuide(overlay, locking);
-
         const now = performance.now();
+        if (locking) lastLockingRef.current = now;
+        // Stay in the locking "session" through brief blips (grace window).
+        const inSession =
+          locking ||
+          (lastLockingRef.current != null &&
+            now - lastLockingRef.current < LOCK_GRACE_MS);
+
+        drawGuide(overlay, inSession);
+
         let held = 0;
-        if (locking) {
+        if (inSession) {
           if (lockStartRef.current == null) lockStartRef.current = now;
           held = now - lockStartRef.current;
           setHintOnce("Hold still…");
@@ -256,7 +274,7 @@ export default function CameraScreen({
         }
 
         if (hudRef.current) {
-          hudRef.current.textContent = `sharp:${Math.round(sharp)} mot:${motion.toFixed(
+          hudRef.current.textContent = `sharp:${Math.round(sharp)} mot:${motionAvg.toFixed(
             1,
           )} held:${Math.round(held)}ms`;
         }
