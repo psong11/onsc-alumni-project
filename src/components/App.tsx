@@ -131,8 +131,8 @@ function CapturedPreview({
   }, [blob]);
 
   return (
-    <main className="mx-auto flex min-h-dvh max-w-md flex-col gap-4 p-4">
-      <div className="flex items-center justify-between text-sm text-neutral-500">
+    <main className="flex h-dvh flex-col">
+      <div className="flex items-center justify-between px-4 pb-2 pt-3 text-sm text-neutral-500">
         <span>
           Batch: {batch.program} · {batch.year}
         </span>
@@ -140,23 +140,27 @@ function CapturedPreview({
           Change batch
         </button>
       </div>
-      <p className="text-center text-sm text-neutral-500">
+      <p className="px-4 pb-2 text-center text-sm text-neutral-500">
         Captured ✓ — reading the form is the next phase.
       </p>
-      {url && (
-        // eslint-disable-next-line @next/next/no-img-element
-        <img
-          src={url}
-          alt="Captured form"
-          className="w-full rounded-xl border border-neutral-200"
-        />
-      )}
-      <button
-        onClick={onAgain}
-        className="mt-2 w-full rounded-xl bg-neutral-900 px-4 py-3.5 text-lg font-medium text-white"
-      >
-        Scan another
-      </button>
+      <div className="min-h-0 flex-1 px-4">
+        {url && (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img
+            src={url}
+            alt="Captured form"
+            className="mx-auto h-full w-auto max-w-full rounded-xl border border-neutral-200 object-contain"
+          />
+        )}
+      </div>
+      <div className="p-4">
+        <button
+          onClick={onAgain}
+          className="w-full rounded-xl bg-neutral-900 px-4 py-3.5 text-lg font-medium text-white"
+        >
+          Scan another
+        </button>
+      </div>
     </main>
   );
 }

@@ -22,7 +22,7 @@ const MOTION_MAX = 8.0; // smoothed gray-diff below this = "steady" (handheld-fr
 const MOTION_SMOOTH = 0.35; // EMA weight on new motion samples (smooths jitter spikes)
 const SHARP_MIN = 40; // Laplacian variance above this = "in focus / has content"
 const BRIGHT_LUMA = 150; // gray value above this counts as "paper-white"
-const BRIGHT_FRAC_MIN = 0.55; // this fraction of the center being paper-white = a form fills the frame
+const BRIGHT_FRAC_MIN = 0.65; // this fraction of the center being paper-white = a form fills the frame
 const LOCK_GRACE_MS = 250; // tolerate brief unsteady blips without resetting the countdown
 const LOCK_MS = 800; // must stay steady + focused this long before auto-snap
 
