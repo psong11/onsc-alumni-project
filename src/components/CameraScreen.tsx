@@ -5,15 +5,26 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { loadScanner } from "@/lib/scanner";
 import type { Batch } from "@/lib/types";
 
-type Status = "starting" | "denied" | "error" | "scanning" | "captured";
+type Status =
+  | "starting"
+  | "denied"
+  | "error"
+  | "scanning"
+  | "capturing"
+  | "captured";
 
-const PROC_WIDTH = 480; // downscaled width used for detection (speed)
-const CAPTURE_MAX_EDGE = 1568; // matches the resolution we send to Claude
-const COVERAGE_MIN = 0.35; // document must fill >= 35% of the frame
-const STABLE_FRAMES = 12; // ~0.4s held steady before auto-snap
-const MOVE_TOLERANCE = 14; // px of corner drift allowed (in proc space)
+const VIDEO_W_IDEAL = 2560;
+const VIDEO_H_IDEAL = 1440;
+const CAPTURE_MAX_EDGE = 1568; // matches the resolution Claude effectively sees
+const PROC_WIDTH = 480; // downscaled width for detection (speed)
+const COVERAGE_MIN = 0.3; // document must fill >= 30% of the frame
+const DETECT_STREAK_FRAMES = 20; // ~0.7s of continuous detection → auto-capture
+const SHARP_SAMPLES = 7; // frames sampled per capture
+const SHARP_INTERVAL_MS = 40; // spacing between samples (~280ms total)
 
 type Pt = [number, number];
+
+const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 function quadArea(p: Pt[]): number {
   let a = 0;
@@ -22,14 +33,6 @@ function quadArea(p: Pt[]): number {
     a += p[i][0] * p[j][1] - p[j][0] * p[i][1];
   }
   return Math.abs(a) / 2;
-}
-
-function maxCornerDelta(a: Pt[], b: Pt[]): number {
-  let m = 0;
-  for (let i = 0; i < a.length; i++) {
-    m = Math.max(m, Math.hypot(a[i][0] - b[i][0], a[i][1] - b[i][1]));
-  }
-  return m;
 }
 
 function drawQuad(
@@ -48,6 +51,40 @@ function drawQuad(
   ctx.stroke();
 }
 
+// Sharpness = variance of the Laplacian on a small grayscale copy. Higher = crisper.
+function sharpnessFromVideo(
+  video: HTMLVideoElement,
+  scratch: HTMLCanvasElement,
+): number {
+  const w = 320;
+  const h = Math.max(1, Math.round((video.videoHeight / video.videoWidth) * w));
+  scratch.width = w;
+  scratch.height = h;
+  const ctx = scratch.getContext("2d", { willReadFrequently: true })!;
+  ctx.drawImage(video, 0, 0, w, h);
+  const d = ctx.getImageData(0, 0, w, h).data;
+  const g = new Float64Array(w * h);
+  for (let i = 0, p = 0; i < d.length; i += 4, p++) {
+    g[p] = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+  }
+  let sum = 0;
+  let sum2 = 0;
+  let n = 0;
+  for (let y = 1; y < h - 1; y++) {
+    for (let x = 1; x < w - 1; x++) {
+      const idx = y * w + x;
+      const lap =
+        -4 * g[idx] + g[idx - 1] + g[idx + 1] + g[idx - w] + g[idx + w];
+      sum += lap;
+      sum2 += lap * lap;
+      n++;
+    }
+  }
+  if (!n) return 0;
+  const mean = sum / n;
+  return sum2 / n - mean * mean;
+}
+
 export default function CameraScreen({
   batch,
   onCapture,
@@ -59,50 +96,60 @@ export default function CameraScreen({
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const overlayRef = useRef<HTMLCanvasElement>(null);
+  const hudRef = useRef<HTMLDivElement>(null);
   const procRef = useRef<HTMLCanvasElement | null>(null);
   const rafRef = useRef<number | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const scannerRef = useRef<any>(null);
-  const prevCornersRef = useRef<Pt[] | null>(null);
-  const stableCountRef = useRef(0);
+  const cvLoadedRef = useRef(false);
+  const streakRef = useRef(0);
   const capturedRef = useRef(false);
 
   const [status, setStatus] = useState<Status>("starting");
   const [hint, setHint] = useState("Point at a form");
   const [autoReady, setAutoReady] = useState(false);
 
-  const stopAll = useCallback(() => {
-    if (rafRef.current) cancelAnimationFrame(rafRef.current);
-    rafRef.current = null;
-    streamRef.current?.getTracks().forEach((t) => t.stop());
-    streamRef.current = null;
-  }, []);
-
-  const capture = useCallback(() => {
+  // Grab several frames, keep the sharpest → big win against hand-shake blur.
+  const captureSharpest = useCallback(async () => {
     const video = videoRef.current;
     if (capturedRef.current || !video || !video.videoWidth) return;
     capturedRef.current = true;
-    setStatus("captured");
-    navigator.vibrate?.(40); // no-op on iOS, nice on Android
+    setStatus("capturing");
+    if (rafRef.current) cancelAnimationFrame(rafRef.current);
 
     const vw = video.videoWidth;
     const vh = video.videoHeight;
     const scale = Math.min(1, CAPTURE_MAX_EDGE / Math.max(vw, vh));
     const cw = Math.round(vw * scale);
     const ch = Math.round(vh * scale);
-    const canvas = document.createElement("canvas");
-    canvas.width = cw;
-    canvas.height = ch;
-    canvas.getContext("2d")!.drawImage(video, 0, 0, cw, ch);
-    stopAll();
-    canvas.toBlob(
-      (blob) => {
-        if (blob) onCapture(blob);
+    const scratch = document.createElement("canvas");
+    const best = document.createElement("canvas");
+    best.width = cw;
+    best.height = ch;
+    const bestCtx = best.getContext("2d")!;
+    let bestScore = -1;
+
+    for (let i = 0; i < SHARP_SAMPLES; i++) {
+      const score = sharpnessFromVideo(video, scratch);
+      if (score > bestScore) {
+        bestScore = score;
+        bestCtx.drawImage(video, 0, 0, cw, ch); // same frame we just scored
+      }
+      if (i < SHARP_SAMPLES - 1) await delay(SHARP_INTERVAL_MS);
+    }
+
+    navigator.vibrate?.(40);
+    setStatus("captured");
+    streamRef.current?.getTracks().forEach((t) => t.stop());
+    streamRef.current = null;
+    best.toBlob(
+      (b) => {
+        if (b) onCapture(b);
       },
       "image/jpeg",
-      0.9,
+      0.92,
     );
-  }, [onCapture, stopAll]);
+  }, [onCapture]);
 
   // Start the rear camera.
   useEffect(() => {
@@ -112,8 +159,8 @@ export default function CameraScreen({
         const stream = await navigator.mediaDevices.getUserMedia({
           video: {
             facingMode: { ideal: "environment" },
-            width: { ideal: 1920 },
-            height: { ideal: 1080 },
+            width: { ideal: VIDEO_W_IDEAL },
+            height: { ideal: VIDEO_H_IDEAL },
           },
           audio: false,
         });
@@ -122,6 +169,18 @@ export default function CameraScreen({
           return;
         }
         streamRef.current = stream;
+        // Best-effort continuous autofocus (support varies by device).
+        try {
+          const track = stream.getVideoTracks()[0];
+          const caps = (track.getCapabilities?.() ?? {}) as any;
+          if (caps.focusMode?.includes?.("continuous")) {
+            await track.applyConstraints({
+              advanced: [{ focusMode: "continuous" } as any],
+            });
+          }
+        } catch {
+          /* ignore */
+        }
         const video = videoRef.current!;
         video.srcObject = stream;
         await video.play().catch(() => {});
@@ -133,19 +192,16 @@ export default function CameraScreen({
     })();
     return () => {
       cancelled = true;
-      stopAll();
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+      streamRef.current?.getTracks().forEach((t) => t.stop());
+      streamRef.current = null;
     };
-  }, [stopAll]);
+  }, []);
 
   // Load detection (best-effort) and run the per-frame loop.
   useEffect(() => {
     if (status !== "scanning") return;
     let active = true;
-
-    function resetStable() {
-      stableCountRef.current = 0;
-      prevCornersRef.current = null;
-    }
 
     function detectFrame(video: HTMLVideoElement, overlay: HTMLCanvasElement) {
       const w = window as any;
@@ -157,76 +213,59 @@ export default function CameraScreen({
       }
       octx.clearRect(0, 0, overlay.width, overlay.height);
 
-      if (!scannerRef.current || !w.cv) return; // manual-only
+      let detected = false;
+      let coverage = 0;
 
-      if (!procRef.current) procRef.current = document.createElement("canvas");
-      const proc = procRef.current;
-      const vw = video.videoWidth;
-      const vh = video.videoHeight;
-      const pw = PROC_WIDTH;
-      const ph = Math.round((vh / vw) * PROC_WIDTH);
-      proc.width = pw;
-      proc.height = ph;
-      proc.getContext("2d")!.drawImage(video, 0, 0, pw, ph);
+      if (scannerRef.current && w.cv) {
+        if (!procRef.current) procRef.current = document.createElement("canvas");
+        const proc = procRef.current;
+        const pw = PROC_WIDTH;
+        const ph = Math.round((video.videoHeight / video.videoWidth) * PROC_WIDTH);
+        proc.width = pw;
+        proc.height = ph;
+        proc.getContext("2d")!.drawImage(video, 0, 0, pw, ph);
 
-      let mat: any;
-      let contour: any;
-      try {
-        mat = w.cv.imread(proc);
-        contour = scannerRef.current.findPaperContour(mat);
-      } catch {
+        let mat: any;
+        try {
+          mat = w.cv.imread(proc);
+          const contour = scannerRef.current.findPaperContour(mat);
+          if (contour) {
+            const c = scannerRef.current.getCornerPoints(contour);
+            const pts: Pt[] = [
+              [c.topLeftCorner.x, c.topLeftCorner.y],
+              [c.topRightCorner.x, c.topRightCorner.y],
+              [c.bottomRightCorner.x, c.bottomRightCorner.y],
+              [c.bottomLeftCorner.x, c.bottomLeftCorner.y],
+            ];
+            coverage = quadArea(pts) / (pw * ph);
+            detected = coverage >= COVERAGE_MIN;
+            drawQuad(
+              octx,
+              pts,
+              overlay.width / pw,
+              overlay.height / ph,
+              detected ? "#22c55e" : "#eab308",
+            );
+          }
+        } catch {
+          /* ignore frame */
+        }
         mat?.delete?.();
-        return;
-      }
-      if (!contour) {
-        mat.delete();
-        resetStable();
-        setHint("Point at a form");
-        return;
       }
 
-      let c: any;
-      try {
-        c = scannerRef.current.getCornerPoints(contour);
-      } catch {
-        mat.delete();
-        resetStable();
-        return;
-      }
-      mat.delete();
-
-      const pts: Pt[] = [
-        [c.topLeftCorner.x, c.topLeftCorner.y],
-        [c.topRightCorner.x, c.topRightCorner.y],
-        [c.bottomRightCorner.x, c.bottomRightCorner.y],
-        [c.bottomLeftCorner.x, c.bottomLeftCorner.y],
-      ];
-      const coverage = quadArea(pts) / (pw * ph);
-      const enough = coverage >= COVERAGE_MIN;
-
-      drawQuad(
-        octx,
-        pts,
-        overlay.width / pw,
-        overlay.height / ph,
-        enough ? "#22c55e" : "#eab308",
-      );
-
-      if (!enough) {
-        setHint("Move closer — fill the frame");
-        resetStable();
-        return;
-      }
-
-      const prev = prevCornersRef.current;
-      const steady = prev ? maxCornerDelta(pts, prev) < MOVE_TOLERANCE : false;
-      prevCornersRef.current = pts;
-      setHint("Hold steady…");
-      if (steady) {
-        stableCountRef.current += 1;
-        if (stableCountRef.current >= STABLE_FRAMES) capture();
+      if (detected) {
+        streakRef.current += 1;
+        setHint("Hold still…");
+        if (streakRef.current >= DETECT_STREAK_FRAMES) captureSharpest();
       } else {
-        stableCountRef.current = 0;
+        streakRef.current = 0;
+        setHint(coverage > 0 ? "Move closer — fill the frame" : "Point at a form");
+      }
+
+      if (hudRef.current) {
+        hudRef.current.textContent = `cv:${cvLoadedRef.current ? "y" : "n"} det:${
+          detected ? "y" : "n"
+        } cov:${Math.round(coverage * 100)}% streak:${streakRef.current}`;
       }
     }
 
@@ -241,11 +280,13 @@ export default function CameraScreen({
     (async () => {
       const ok = await loadScanner();
       if (!active) return;
+      cvLoadedRef.current = ok;
       if (ok) {
         try {
           scannerRef.current = new (window as any).jscanify();
           setAutoReady(true);
         } catch {
+          cvLoadedRef.current = false;
           setAutoReady(false);
         }
       }
@@ -256,7 +297,7 @@ export default function CameraScreen({
       active = false;
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
     };
-  }, [status, capture]);
+  }, [status, captureSharpest]);
 
   return (
     <div className="relative min-h-dvh overflow-hidden bg-black">
@@ -266,7 +307,9 @@ export default function CameraScreen({
         </span>
         <button
           onClick={() => {
-            stopAll();
+            if (rafRef.current) cancelAnimationFrame(rafRef.current);
+            streamRef.current?.getTracks().forEach((t) => t.stop());
+            streamRef.current = null;
             onChangeBatch();
           }}
           className="text-neutral-300 underline"
@@ -274,6 +317,12 @@ export default function CameraScreen({
           Change batch
         </button>
       </div>
+
+      {/* debug HUD — remove once auto-capture is dialed in */}
+      <div
+        ref={hudRef}
+        className="absolute left-2 top-12 z-20 rounded bg-black/60 px-2 py-1 font-mono text-[11px] text-green-300"
+      />
 
       <video
         ref={videoRef}
@@ -300,7 +349,7 @@ export default function CameraScreen({
               {autoReady ? hint : "Tap the button to capture"}
             </p>
             <button
-              onClick={capture}
+              onClick={captureSharpest}
               aria-label="Capture"
               className="h-16 w-16 rounded-full border-4 border-white bg-white/20 transition active:scale-95"
             />
@@ -308,19 +357,21 @@ export default function CameraScreen({
         </>
       )}
 
+      {status === "capturing" && (
+        <div className="absolute inset-0 z-30 flex items-center justify-center bg-black/70 text-lg text-white">
+          Capturing…
+        </div>
+      )}
       {status === "captured" && (
         <div className="absolute inset-0 z-30 flex items-center justify-center bg-black/80 text-lg text-white">
           Captured ✓
         </div>
       )}
-
-      {status === "starting" && (
-        <Centered>Starting camera…</Centered>
-      )}
+      {status === "starting" && <Centered>Starting camera…</Centered>}
       {status === "denied" && (
         <Centered>
-          Camera access was denied. Enable the camera for this site in your
-          browser settings, then reload.
+          Camera access was denied. Enable the camera for this site in Settings,
+          then reload.
         </Centered>
       )}
       {status === "error" && <Centered>Couldn&rsquo;t start the camera.</Centered>}
